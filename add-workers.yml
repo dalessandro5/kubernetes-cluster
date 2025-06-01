@@ -124,7 +124,7 @@
         msg: "{{ all_nodes.stdout_lines }}"
         
     - name: Count worker nodes
-      shell: kubectl get nodes --no-headers | grep -v master | grep -c Ready || echo "0"
+      shell: kubectl get nodes --no-headers -l '!node-role.kubernetes.io/control-plane' | grep -c Ready || echo "0"
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       register: ready_workers
