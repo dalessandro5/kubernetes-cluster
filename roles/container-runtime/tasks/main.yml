@@ -1,0 +1,52 @@
+---
+- name: Add Docker repository
+  yum_repository:
+    name: docker-ce
+    description: Docker CE Stable
+    baseurl: https://download.docker.com/linux/centos/9/$basearch/stable
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+
+- name: Install containerd
+  dnf:
+    name:
+      - containerd.io
+    state: present
+
+- name: Create containerd configuration directory
+  file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+
+- name: Generate default containerd configuration
+  shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Configure containerd to use systemd cgroup driver
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  notify: restart containerd
+
+- name: Enable CRI plugin in containerd
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'disabled_plugins = \["cri"\]'
+    replace: 'disabled_plugins = []'
+  notify: restart containerd
+
+- name: Start and enable containerd
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Verify containerd is running
+  command: systemctl is-active containerd
+  register: containerd_status
+  failed_when: containerd_status.stdout != "active"

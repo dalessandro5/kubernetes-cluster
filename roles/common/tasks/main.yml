@@ -1,0 +1,64 @@
+---
+- name: Update system packages
+  dnf:
+    name: "*"
+    state: latest
+    update_cache: yes
+
+- name: Install required packages
+  dnf:
+    name:
+      - curl
+      - wget
+      - vim
+      - git
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+      - iproute-tc
+    state: present
+
+- name: Disable swap
+  shell: |
+    swapoff -a
+    sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  when: swap_disabled | default(true)
+
+- name: Set SELinux to permissive
+  selinux:
+    policy: targeted
+    state: "{{ selinux_state | default('permissive') }}"
+
+- name: Disable firewall
+  systemd:
+    name: firewalld
+    state: stopped
+    enabled: no
+  when: firewall_disabled | default(true)
+
+- name: Load kernel modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Create modules-load configuration
+  copy:
+    content: |
+      overlay
+      br_netfilter
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+
+- name: Configure sysctl for Kubernetes
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+    - { name: 'net.ipv4.ip_forward', value: '1' }

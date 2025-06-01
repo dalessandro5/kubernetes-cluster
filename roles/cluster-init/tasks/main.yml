@@ -1,0 +1,294 @@
+---
+# Add all master nodes to /etc/hosts
+- name: Add all master nodes to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item]['ansible_host'] }} {{ item }}"
+    regexp: "^{{ hostvars[item]['ansible_host'] }}.*{{ item }}.*$"
+    state: present
+    backup: yes
+  loop: "{{ groups['masters'] }}"
+  when: groups['masters'] is defined
+
+- name: Check if cluster is already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeconfig_exists
+
+# Complete cluster reset and cleanup - ULTRA AGGRESSIVE XDDDD
+- name: Kill processes using Kubernetes ports with fuser
+  shell: |
+    fuser -k 6443/tcp || true
+    fuser -k 10259/tcp || true
+    fuser -k 10257/tcp || true
+    fuser -k 10250/tcp || true
+    fuser -k 2379/tcp || true
+    fuser -k 2380/tcp || true
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Stop kubelet and containerd services forcefully
+  shell: |
+    systemctl stop kubelet || true
+    systemctl stop containerd || true
+    systemctl disable kubelet || true
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Kill any remaining Kubernetes processes
+  shell: |
+    ps aux | grep -E '(kube|etcd)' | grep -v grep | awk '{print $2}' | xargs kill -9 || true
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Reset Kubernetes cluster completely
+  shell: kubeadm reset -f --cleanup-tmp-dir
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Remove all containers and images
+  shell: |
+    crictl rm -f $(crictl ps -aq) || true
+    crictl rmi $(crictl images -q) || true
+    docker system prune -af || true
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Force remove Kubernetes directories and files
+  shell: |
+    umount /var/lib/kubelet/pods/*/volumes/kubernetes.io~secret/* || true
+    umount /var/lib/kubelet/pods/*/volumes/kubernetes.io~configmap/* || true
+    rm -rf /etc/kubernetes
+    rm -rf /var/lib/etcd
+    rm -rf /var/lib/kubelet
+    rm -rf /var/lib/dockershim
+    rm -rf /var/run/kubernetes
+    rm -rf /root/.kube
+    rm -rf /etc/cni/net.d
+    rm -rf /opt/cni/bin
+    rm -rf /var/lib/cni
+    rm -rf /etc/systemd/system/kubelet.service.d
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Clean iptables rules completely
+  shell: |
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -t raw -F
+    iptables -t raw -X
+    ip6tables -F
+    ip6tables -X
+    ip6tables -t nat -F
+    ip6tables -t nat -X
+    ip6tables -t mangle -F
+    ip6tables -t mangle -X
+    ip6tables -t raw -F
+    ip6tables -t raw -X
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Restart and enable containerd
+  shell: |
+    systemctl start containerd
+    systemctl enable containerd
+    systemctl enable kubelet
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Wait for services to stabilize
+  pause:
+    seconds: 45
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Verify ports are actually free
+  shell: |
+    netstat -tulpn | grep -E ':(6443|10250|10259|10257|2379|2380)\s' || echo "Ports are free"
+  register: port_check
+  when: inventory_hostname == groups['masters'][0]
+  ignore_errors: yes
+
+- name: Display port status
+  debug:
+    var: port_check.stdout_lines
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Initialize Kubernetes cluster (first master only)
+  shell: |
+    kubeadm init \
+      --apiserver-advertise-address={{ api_server_advertise_address }} \
+      --apiserver-bind-port={{ api_server_bind_port }} \
+      --pod-network-cidr={{ pod_network_cidr }} \
+      --service-cidr={{ service_cidr }} \
+      --control-plane-endpoint={{ api_server_advertise_address }}:{{ api_server_bind_port }} \
+      --upload-certs \
+      --ignore-preflight-errors=Port-6443,Port-10259,Port-10257,Port-10250,Port-2379,Port-2380,FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml,FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml,FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml,FileAvailable--etc-kubernetes-manifests-etcd.yaml,DirAvailable--var-lib-etcd \
+      --v=5 2>&1 | tee /tmp/kubeadm-init.log
+  register: kubeadm_init_result
+  when: inventory_hostname == groups['masters'][0]
+  retries: 1
+  delay: 10
+  until: kubeadm_init_result.rc == 0
+  failed_when: false
+
+- name: Display full kubeadm init output on failure
+  debug:
+    msg: "{{ kubeadm_init_result.stdout_lines + kubeadm_init_result.stderr_lines }}"
+  when: 
+    - inventory_hostname == groups['masters'][0]
+    - kubeadm_init_result.rc != 0
+
+- name: Fail if kubeadm init was not successful
+  fail:
+    msg: "kubeadm init failed with exit code {{ kubeadm_init_result.rc }}"
+  when:
+    - inventory_hostname == groups['masters'][0]
+    - kubeadm_init_result.rc != 0
+
+# Verify cluster initialization
+- name: Verify cluster initialization
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf_check
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Fail if cluster initialization unsuccessful
+  fail:
+    msg: "Cluster initialization failed - admin.conf not found"
+  when: 
+    - inventory_hostname == groups['masters'][0]
+    - not admin_conf_check.stat.exists
+
+- name: Create .kube directory for root
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0755'
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Copy admin.conf to .kube/config
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: '0644'
+  when: inventory_hostname == groups['masters'][0]
+
+# Configure kubectl access for admin-kube user on ALL masters
+- name: Create .kube directory for admin-kube user
+  file:
+    path: /home/admin-kube/.kube
+    state: directory
+    owner: admin-kube
+    group: admin-kube
+    mode: '0755'
+  # Remove the 'when' condition to run on all masters
+
+- name: Copy admin.conf to admin-kube user
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/admin-kube/.kube/config
+    owner: admin-kube
+    group: admin-kube
+    mode: '0600'
+    remote_src: yes
+  # Remove the 'when' condition to run on all masters
+
+# Fix certificate authority configuration
+- name: Set proper ownership for admin-kube kubeconfig
+  file:
+    path: /home/admin-kube/.kube/config
+    owner: admin-kube
+    group: admin-kube
+    mode: '0600'
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Verify kubeconfig works for admin-kube user
+  shell: |
+    export KUBECONFIG=/home/admin-kube/.kube/config
+    kubectl cluster-info
+  become_user: admin-kube
+  when: inventory_hostname == groups['masters'][0]
+  register: kubectl_test
+  failed_when: false
+
+- name: Display kubectl test result
+  debug:
+    var: kubectl_test
+  when: inventory_hostname == groups['masters'][0]
+
+# Wait for API server to be ready
+- name: Wait for Kubernetes API server to be ready
+  uri:
+    url: "https://{{ api_server_advertise_address }}:{{ api_server_bind_port }}/healthz"
+    method: GET
+    validate_certs: no
+    status_code: 200
+  register: api_server_check
+  until: api_server_check.status == 200
+  retries: 30
+  delay: 10
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Get join command for control plane nodes
+  shell: kubeadm token create --print-join-command --certificate-key $(kubeadm init phase upload-certs --upload-certs | tail -1)
+  register: join_command_masters
+  when: inventory_hostname == groups['masters'][0]
+  retries: 3
+  delay: 10
+  until: join_command_masters.rc == 0
+
+- name: Set join command fact
+  set_fact:
+    master_join_command: "{{ join_command_masters.stdout }}"
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Join additional master nodes to cluster
+  shell: "{{ hostvars[groups['masters'][0]]['master_join_command'] }} --control-plane"
+  when: 
+    - inventory_hostname != groups['masters'][0]
+    - hostvars[groups['masters'][0]]['master_join_command'] is defined
+  retries: 3
+  delay: 30
+  until: result.rc == 0
+  register: result
+
+- name: Create .kube directory for additional masters
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0755'
+  when: inventory_hostname != groups['masters'][0]
+
+- name: Copy admin.conf to .kube/config for additional masters
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: '0644'
+  when: inventory_hostname != groups['masters'][0]
+
+- name: Install Flannel CNI (first master only)
+  shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: 
+    - inventory_hostname == groups['masters'][0]
+    - cni_plugin == 'flannel'
+  register: flannel_result
+  until: flannel_result.rc == 0
+  retries: 5
+  delay: 10
+
+- name: Wait for all nodes to be ready
+  shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: nodes_not_ready
+  until: nodes_not_ready.stdout == "0"
+  retries: 30
+  delay: 10
+  when: inventory_hostname == groups['masters'][0]

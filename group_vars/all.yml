@@ -1,0 +1,25 @@
+---
+# Kubernetes version
+kubernetes_version: "1.28"
+kubernetes_version_rhel_package: "1.28.0"
+
+# Container runtime
+container_runtime: containerd
+containerd_version: "1.7.8"
+
+# Network settings
+pod_network_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+
+# Cluster settings
+cluster_name: "kubernetes-cluster"
+api_server_advertise_address: "192.168.1.139"  # First master IP
+api_server_bind_port: 6443
+
+# CNI Plugin
+cni_plugin: flannel
+
+# System settings
+swap_disabled: true
+selinux_state: permissive
+firewall_disabled: true

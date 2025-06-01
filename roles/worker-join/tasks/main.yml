@@ -1,0 +1,48 @@
+---
+# Get the join command from the first master
+- name: Get worker join command from master
+  shell: kubeadm token create --print-join-command
+  register: worker_join_command
+  when: inventory_hostname == groups['masters'][0]
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Set join command fact
+  set_fact:
+    worker_join_cmd: "{{ hostvars[groups['masters'][0]]['worker_join_command']['stdout'] }}"
+  when: inventory_hostname in groups['workers']
+
+- name: Check if node is already part of cluster
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf_exists
+  when: inventory_hostname in groups['workers']
+
+- name: Join worker node to cluster
+  shell: "{{ worker_join_cmd }}"
+  when: 
+    - inventory_hostname in groups['workers']
+    - not kubelet_conf_exists.stat.exists
+    - worker_join_cmd is defined
+  register: join_result
+  retries: 3
+  delay: 30
+  until: join_result.rc == 0
+
+- name: Verify worker node joined successfully
+  shell: kubectl get nodes {{ inventory_hostname }} --no-headers
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['masters'][0] }}"
+  register: node_status
+  when: inventory_hostname in groups['workers']
+  retries: 10
+  delay: 15
+  until: node_status.rc == 0
+
+- name: Display worker node status
+  debug:
+    msg: "Worker node {{ inventory_hostname }} status: {{ node_status.stdout }}"
+  when: 
+    - inventory_hostname in groups['workers']
+    - node_status is defined

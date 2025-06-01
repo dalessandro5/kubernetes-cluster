@@ -1,0 +1,137 @@
+---
+- name: Add Worker Nodes to Existing Kubernetes Cluster
+  hosts: workers
+  become: yes
+  gather_facts: yes
+  serial: 1
+  
+  pre_tasks:
+    - name: Verify cluster is initialized
+      uri:
+        url: "https://{{ hostvars[groups['masters'][0]]['ansible_host'] }}:6443/healthz"
+        method: GET
+        validate_certs: no
+        status_code: 200
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Check if worker is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf_exists
+
+  roles:
+    - common
+    - container-runtime
+    - kubernetes
+
+  tasks:
+    - name: Get current join command from master
+      shell: kubeadm token create --print-join-command
+      register: join_command_result
+      delegate_to: "{{ groups['masters'][0] }}"
+      run_once: true
+      when: not kubelet_conf_exists.stat.exists
+
+    - name: Set join command fact for all workers
+      set_fact:
+        worker_join_command: "{{ hostvars[groups['masters'][0]]['join_command_result']['stdout'] }}"
+      when: 
+        - not kubelet_conf_exists.stat.exists
+        - hostvars[groups['masters'][0]]['join_command_result'] is defined
+
+    - name: Join worker to cluster
+      shell: "{{ worker_join_command }}"
+      when: 
+        - not kubelet_conf_exists.stat.exists
+        - worker_join_command is defined
+      register: join_result
+      retries: 3
+      delay: 30
+      until: join_result.rc == 0
+
+    - name: Wait for kubelet to start
+      wait_for:
+        port: 10250
+        host: "{{ ansible_default_ipv4.address }}"
+        delay: 10
+        timeout: 300
+      when: join_result is changed
+
+    # Add .kube directory setup for admin-kube user
+    - name: Create .kube directory for admin-kube user
+      file:
+        path: /home/admin-kube/.kube
+        state: directory
+        owner: admin-kube
+        group: admin-kube
+        mode: '0755'
+
+    - name: Fetch admin.conf from master
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: /tmp/admin.conf
+        flat: yes
+      delegate_to: "{{ groups['masters'][0] }}"
+      run_once: true
+
+    - name: Copy admin.conf to worker for admin-kube user
+      copy:
+        src: /tmp/admin.conf
+        dest: /home/admin-kube/.kube/config
+        owner: admin-kube
+        group: admin-kube
+        mode: '0600'
+
+    - name: Verify kubectl access for admin-kube user
+      shell: kubectl get nodes
+      become_user: admin-kube
+      environment:
+        KUBECONFIG: /home/admin-kube/.kube/config
+      register: kubectl_test
+      failed_when: false
+
+    - name: Display kubectl test result for admin-kube
+      debug:
+        var: kubectl_test
+      when: kubectl_test is defined
+
+    - name: Verify node appears in cluster
+      shell: kubectl get nodes {{ inventory_hostname }} --no-headers
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: node_verification
+      retries: 10
+      delay: 15
+      until: node_verification.rc == 0
+      when: join_result is changed
+
+- name: Verify All Workers Joined Successfully
+  hosts: masters[0]
+  become: yes
+  gather_facts: no
+  
+  tasks:
+    - name: Get all nodes status
+      shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_nodes
+      
+    - name: Display cluster nodes
+      debug:
+        msg: "{{ all_nodes.stdout_lines }}"
+        
+    - name: Count worker nodes
+      shell: kubectl get nodes --no-headers | grep -v master | grep -c Ready || echo "0"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ready_workers
+      
+    - name: Verify expected number of workers
+      assert:
+        that:
+          - ready_workers.stdout|int == groups['workers']|length
+        fail_msg: "Expected {{ groups['workers']|length }} workers, but only {{ ready_workers.stdout }} are ready"
+        success_msg: "All {{ groups['workers']|length }} worker nodes successfully joined the cluster"

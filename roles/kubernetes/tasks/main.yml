@@ -1,0 +1,26 @@
+---
+- name: Add Kubernetes repository
+  yum_repository:
+    name: kubernetes
+    description: Kubernetes
+    baseurl: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/
+    gpgcheck: yes
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/repodata/repomd.xml.key
+    enabled: yes
+    exclude: kubelet kubeadm kubectl cri-tools kubernetes-cni
+
+- name: Install Kubernetes packages
+  dnf:
+    name:
+      - kubelet-{{ kubernetes_version_rhel_package }}
+      - kubeadm-{{ kubernetes_version_rhel_package }}
+      - kubectl-{{ kubernetes_version_rhel_package }}
+    state: present
+    disable_excludes: kubernetes
+
+- name: Start and enable kubelet
+  systemd:
+    name: kubelet
+    state: started
+    enabled: yes
+    daemon_reload: yes
