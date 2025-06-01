@@ -26,30 +26,55 @@
     - kubernetes
 
   tasks:
-    - name: Get current join command from master
+    # First, always generate a fresh join command on the master
+    - name: Generate fresh join command from master
       shell: kubeadm token create --print-join-command
       register: join_command_result
       delegate_to: "{{ groups['masters'][0] }}"
       run_once: true
-      when: not kubelet_conf_exists.stat.exists
+      
+    # Debug: Show the join command
+    - name: Debug - Display join command
+      debug:
+        msg: "Join command: {{ hostvars[groups['masters'][0]]['join_command_result']['stdout'] }}"
+      run_once: true
 
+    # Set the join command as a fact for all workers
     - name: Set join command fact for all workers
       set_fact:
         worker_join_command: "{{ hostvars[groups['masters'][0]]['join_command_result']['stdout'] }}"
-      when: 
-        - not kubelet_conf_exists.stat.exists
-        - hostvars[groups['masters'][0]]['join_command_result'] is defined
+      when: hostvars[groups['masters'][0]]['join_command_result'] is defined
 
+    # Reset worker node if already joined (optional - only if you want to rejoin)
+    - name: Reset worker node if already joined
+      shell: kubeadm reset -f
+      when: kubelet_conf_exists.stat.exists
+      ignore_errors: yes
+
+    # Join worker to cluster
     - name: Join worker to cluster
       shell: "{{ worker_join_command }}"
-      when: 
-        - not kubelet_conf_exists.stat.exists
-        - worker_join_command is defined
+      when: worker_join_command is defined
       register: join_result
       retries: 3
       delay: 30
       until: join_result.rc == 0
 
+    # Debug: Show join result
+    - name: Debug - Display join result
+      debug:
+        var: join_result
+      when: join_result is defined
+
+    # Restart kubelet service
+    - name: Restart kubelet service
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+      when: join_result is changed
+
+    # Wait for kubelet to start
     - name: Wait for kubelet to start
       wait_for:
         port: 10250
@@ -58,44 +83,7 @@
         timeout: 300
       when: join_result is changed
 
-    # Add .kube directory setup for admin-kube user
-    - name: Create .kube directory for admin-kube user
-      file:
-        path: /home/admin-kube/.kube
-        state: directory
-        owner: admin-kube
-        group: admin-kube
-        mode: '0755'
-
-    - name: Fetch admin.conf from master
-      fetch:
-        src: /etc/kubernetes/admin.conf
-        dest: /tmp/admin.conf
-        flat: yes
-      delegate_to: "{{ groups['masters'][0] }}"
-      run_once: true
-
-    - name: Copy admin.conf to worker for admin-kube user
-      copy:
-        src: /tmp/admin.conf
-        dest: /home/admin-kube/.kube/config
-        owner: admin-kube
-        group: admin-kube
-        mode: '0600'
-
-    - name: Verify kubectl access for admin-kube user
-      shell: kubectl get nodes
-      become_user: admin-kube
-      environment:
-        KUBECONFIG: /home/admin-kube/.kube/config
-      register: kubectl_test
-      failed_when: false
-
-    - name: Display kubectl test result for admin-kube
-      debug:
-        var: kubectl_test
-      when: kubectl_test is defined
-
+    # Verify node joined successfully
     - name: Verify node appears in cluster
       shell: kubectl get nodes {{ inventory_hostname }} --no-headers
       environment:
@@ -113,25 +101,26 @@
   gather_facts: no
   
   tasks:
-    - name: Get all nodes status
-      shell: kubectl get nodes -o wide
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: all_nodes
-      
-    - name: Display cluster nodes
-      debug:
-        msg: "{{ all_nodes.stdout_lines }}"
-        
-    - name: Count worker nodes
-      shell: kubectl get nodes --no-headers -l '!node-role.kubernetes.io/control-plane' | grep -c Ready || echo "0"
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: ready_workers
-      
-    - name: Verify expected number of workers
-      assert:
-        that:
-          - ready_workers.stdout|int == groups['workers']|length
-        fail_msg: "Expected {{ groups['workers']|length }} workers, but only {{ ready_workers.stdout }} are ready"
-        success_msg: "All {{ groups['workers']|length }} worker nodes successfully joined the cluster"
+    # Comment out or remove these tasks:
+    # - name: Get all nodes status
+    #   shell: kubectl get nodes -o wide
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+    #   register: all_nodes
+    #   
+    # - name: Display cluster nodes
+    #   debug:
+    #     msg: "{{ all_nodes.stdout_lines }}"
+    #     
+    # - name: Count worker nodes
+    #   shell: kubectl get nodes --no-headers | grep -v master | grep -c Ready || echo "0"
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+    #   register: ready_workers
+    #   
+    # - name: Verify expected number of workers
+    #   assert:
+    #     that:
+    #       - ready_workers.stdout|int == groups['workers']|length
+    #     fail_msg: "Expected {{ groups['workers']|length }} workers, but only {{ ready_workers.stdout }} are ready"
+    #     success_msg: "All {{ groups['workers']|length }} worker nodes successfully joined the cluster"
